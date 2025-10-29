@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -428,10 +429,15 @@ func runWebSocketServer(addr string) {
 func handleWebSocket(wsConn *websocket.Conn) {
 	var mu sync.Mutex
 	var tcpConn net.Conn
+	var udpConn *net.UDPConn
+	var targetUDPAddr *net.UDPAddr
 
 	defer func() {
 		if tcpConn != nil {
 			_ = tcpConn.Close()
+		}
+		if udpConn != nil {
+			_ = udpConn.Close()
 		}
 		_ = wsConn.Close()
 		log.Printf("WebSocket 连接 %s 已关闭", wsConn.RemoteAddr())
@@ -454,7 +460,20 @@ func handleWebSocket(wsConn *websocket.Conn) {
 		}
 
 		if typ == websocket.BinaryMessage {
-			// 二进制消息直接转写
+			// 处理UDP数据
+			if len(msg) > 9 && string(msg[:9]) == "UDP_DATA:" {
+				if udpConn != nil && targetUDPAddr != nil {
+					data := msg[9:]
+					if _, err := udpConn.WriteToUDP(data, targetUDPAddr); err != nil {
+						log.Printf("[服务端UDP] 发送到目标失败: %v", err)
+					} else {
+						log.Printf("[服务端UDP] 已发送数据到 %s，大小: %d", targetUDPAddr.String(), len(data))
+					}
+				}
+				continue
+			}
+
+			// 二进制消息直接转写（TCP模式）
 			if tcpConn != nil {
 				if _, err := tcpConn.Write(msg); err != nil && !isNormalCloseError(err) {
 					log.Printf("[服务端] 向目标写入二进制失败: %v", err)
@@ -466,7 +485,62 @@ func handleWebSocket(wsConn *websocket.Conn) {
 
 		data := string(msg)
 
-		// CONNECT: 客户端请求连接到目标
+		// UDP_CONNECT: 建立UDP连接
+		if strings.HasPrefix(data, "UDP_CONNECT:") {
+			targetAddr := data[12:]
+			log.Printf("[服务端UDP] 收到UDP连接请求，目标: %s", targetAddr)
+
+			udpAddr, err := net.ResolveUDPAddr("udp", targetAddr)
+			if err != nil {
+				log.Printf("[服务端UDP] 解析目标地址失败: %v", err)
+				mu.Lock()
+				_ = wsConn.WriteMessage(websocket.TextMessage, []byte("ERROR:解析地址失败"))
+				mu.Unlock()
+				continue
+			}
+
+			if udpConn == nil {
+				udpConn, err = net.ListenUDP("udp", nil)
+				if err != nil {
+					log.Printf("[服务端UDP] 创建UDP套接字失败: %v", err)
+					mu.Lock()
+					_ = wsConn.WriteMessage(websocket.TextMessage, []byte("ERROR:创建UDP失败"))
+					mu.Unlock()
+					continue
+				}
+
+				// 启动UDP接收goroutine
+				go func() {
+					buffer := make([]byte, 65535)
+					for {
+						n, addr, err := udpConn.ReadFromUDP(buffer)
+						if err != nil {
+							if !isNormalCloseError(err) {
+								log.Printf("[服务端UDP] 读取失败: %v", err)
+							}
+							return
+						}
+
+						log.Printf("[服务端UDP] 收到响应来自 %s，大小: %d", addr.String(), n)
+
+						// 构建响应消息: UDP_DATA:host:port:data
+						host, portStr, _ := net.SplitHostPort(addr.String())
+						response := []byte(fmt.Sprintf("UDP_DATA:%s:%s:", host, portStr))
+						response = append(response, buffer[:n]...)
+
+						mu.Lock()
+						_ = wsConn.WriteMessage(websocket.BinaryMessage, response)
+						mu.Unlock()
+					}
+				}()
+			}
+
+			targetUDPAddr = udpAddr
+			log.Printf("[服务端UDP] UDP目标已设置: %s", targetAddr)
+			continue
+		}
+
+		// CONNECT: 客户端请求连接到目标（TCP模式）
 		if strings.HasPrefix(data, "CONNECT:") {
 			parts := strings.SplitN(data[8:], "|", 2)
 			if len(parts) != 2 {
@@ -904,6 +978,17 @@ type SOCKS5Config struct {
 	Host     string
 }
 
+// UDP关联结构（由TCP控制连接管理）
+type UDPAssociation struct {
+	tcpConn       net.Conn
+	udpListener   *net.UDPConn
+	wsConn        *websocket.Conn
+	clientUDPAddr *net.UDPAddr // 客户端第一次发送UDP包时确定
+	mu            sync.Mutex
+	closed        bool
+	done          chan bool
+}
+
 func parseSOCKS5Addr(addr string) (*SOCKS5Config, error) {
 	// 格式: socks5://[user:pass@]ip:port
 	addr = strings.TrimPrefix(addr, "socks5://")
@@ -998,7 +1083,7 @@ func handleSOCKS5Connection(conn net.Conn, config *SOCKS5Config, wsServerAddr st
 	}
 
 	// 处理客户端请求
-	if err := handleSOCKS5Request(conn, clientAddr, wsServerAddr); err != nil {
+	if err := handleSOCKS5Request(conn, clientAddr, wsServerAddr, config); err != nil {
 		log.Printf("[SOCKS5:%s] 处理请求失败: %v", clientAddr, err)
 		return
 	}
@@ -1105,7 +1190,7 @@ func handleSOCKS5UserPassAuth(conn net.Conn, config *SOCKS5Config) error {
 	return nil
 }
 
-func handleSOCKS5Request(conn net.Conn, clientAddr, wsServerAddr string) error {
+func handleSOCKS5Request(conn net.Conn, clientAddr, wsServerAddr string, config *SOCKS5Config) error {
 	// 读取请求头
 	buf := make([]byte, 4)
 	if _, err := io.ReadFull(conn, buf); err != nil {
@@ -1171,13 +1256,19 @@ func handleSOCKS5Request(conn net.Conn, clientAddr, wsServerAddr string) error {
 
 	log.Printf("[SOCKS5:%s] 请求访问目标: %s (命令: %d)", clientAddr, target, command)
 
-	// 只支持 CONNECT 命令
-	if command != ConnectCmd {
+	// 处理不同的命令
+	switch command {
+	case ConnectCmd:
+		return handleSOCKS5Connect(conn, target, clientAddr, wsServerAddr)
+	case UDPAssociateCmd:
+		return handleSOCKS5UDPAssociate(conn, clientAddr, wsServerAddr, config)
+	case BindCmd:
+		sendSOCKS5ErrorResponse(conn, CommandNotSupported)
+		return fmt.Errorf("BIND命令暂不支持")
+	default:
 		sendSOCKS5ErrorResponse(conn, CommandNotSupported)
 		return fmt.Errorf("不支持的命令类型: %d", command)
 	}
-
-	return handleSOCKS5Connect(conn, target, clientAddr, wsServerAddr)
 }
 
 func sendSOCKS5ErrorResponse(conn net.Conn, status uint8) {
@@ -1345,4 +1436,422 @@ func handleSOCKS5Connect(conn net.Conn, target, clientAddr, wsServerAddr string)
 	<-done
 	log.Printf("[SOCKS5:%s] 连接已关闭", clientAddr)
 	return nil
+}
+
+// ======================== SOCKS5 UDP ASSOCIATE ========================
+
+// handleSOCKS5UDPAssociate 处理UDP ASSOCIATE请求（受TCP控制连接控制）
+func handleSOCKS5UDPAssociate(tcpConn net.Conn, clientAddr, wsServerAddr string, config *SOCKS5Config) error {
+	log.Printf("[SOCKS5:%s] 处理UDP ASSOCIATE请求", clientAddr)
+
+	// 获取SOCKS5服务器的监听IP（根据配置）
+	host, _, err := net.SplitHostPort(config.Host)
+	if err != nil {
+		sendSOCKS5ErrorResponse(tcpConn, GeneralFailure)
+		return fmt.Errorf("解析监听地址失败: %v", err)
+	}
+
+	// 创建UDP监听器（端口由系统自动分配，IP使用配置的监听IP）
+	udpAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, "0"))
+	if err != nil {
+		sendSOCKS5ErrorResponse(tcpConn, GeneralFailure)
+		return fmt.Errorf("解析UDP地址失败: %v", err)
+	}
+
+	udpListener, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		sendSOCKS5ErrorResponse(tcpConn, GeneralFailure)
+		return fmt.Errorf("UDP监听失败: %v", err)
+	}
+	defer udpListener.Close()
+
+	// 获取实际监听的端口
+	actualAddr := udpListener.LocalAddr().(*net.UDPAddr)
+	log.Printf("[SOCKS5:%s] UDP中继服务器启动: %s", clientAddr, actualAddr.String())
+
+	// 发送成功响应（包含UDP中继服务器的地址和端口）
+	if err := sendSOCKS5UDPResponse(tcpConn, actualAddr); err != nil {
+		return fmt.Errorf("发送UDP响应失败: %v", err)
+	}
+
+	// 建立WebSocket连接（用于UDP数据转发）
+	wsConn, err := dialWebSocketWithECH(wsServerAddr, 2)
+	if err != nil {
+		return fmt.Errorf("WebSocket(ECH) 连接失败: %v", err)
+	}
+	defer wsConn.Close()
+
+	log.Printf("[SOCKS5:%s] UDP关联的WebSocket连接已建立", clientAddr)
+
+	// 创建UDP关联
+	assoc := &UDPAssociation{
+		tcpConn:     tcpConn,
+		udpListener: udpListener,
+		wsConn:      wsConn,
+		done:        make(chan bool, 2),
+	}
+
+	// 清除TCP连接超时（保持连接活跃）
+	tcpConn.SetDeadline(time.Time{})
+
+	// 启动UDP数据处理goroutine
+	go assoc.handleUDPRelay()
+
+	// 监听TCP控制连接（阻塞等待）
+	go func() {
+		buf := make([]byte, 1)
+		for {
+			_, err := tcpConn.Read(buf)
+			if err != nil {
+				log.Printf("[SOCKS5:%s] TCP控制连接断开，终止UDP关联", clientAddr)
+				assoc.done <- true
+				return
+			}
+		}
+	}()
+
+	// 等待结束信号（TCP断开或UDP出错）
+	<-assoc.done
+
+	assoc.Close()
+	log.Printf("[SOCKS5:%s] UDP关联已终止", clientAddr)
+
+	return nil
+}
+
+// sendSOCKS5UDPResponse 发送UDP ASSOCIATE成功响应
+func sendSOCKS5UDPResponse(conn net.Conn, udpAddr *net.UDPAddr) error {
+	response := make([]byte, 0, 22)
+	response = append(response, 0x05, Succeeded, 0x00)
+
+	// 地址类型和地址
+	ip := udpAddr.IP
+	if ip4 := ip.To4(); ip4 != nil {
+		// IPv4
+		response = append(response, IPv4Addr)
+		response = append(response, ip4...)
+	} else {
+		// IPv6
+		response = append(response, IPv6Addr)
+		response = append(response, ip...)
+	}
+
+	// 端口
+	port := make([]byte, 2)
+	binary.BigEndian.PutUint16(port, uint16(udpAddr.Port))
+	response = append(response, port...)
+
+	_, err := conn.Write(response)
+	return err
+}
+
+// handleUDPRelay 处理UDP数据中继（在UDP关联内）
+func (assoc *UDPAssociation) handleUDPRelay() {
+	buffer := make([]byte, 65535)
+
+	for {
+		n, srcAddr, err := assoc.udpListener.ReadFromUDP(buffer)
+		if err != nil {
+			if !isNormalCloseError(err) {
+				log.Printf("[UDP] 读取失败: %v", err)
+			}
+			assoc.done <- true
+			return
+		}
+
+		// 第一次收到UDP包时，记录客户端UDP地址
+		if assoc.clientUDPAddr == nil {
+			assoc.mu.Lock()
+			if assoc.clientUDPAddr == nil {
+				assoc.clientUDPAddr = srcAddr
+				log.Printf("[UDP] 客户端UDP地址: %s", srcAddr.String())
+			}
+			assoc.mu.Unlock()
+		} else {
+			// 验证UDP包来自正确的客户端
+			if assoc.clientUDPAddr.String() != srcAddr.String() {
+				log.Printf("[UDP] 忽略来自未授权地址的UDP包: %s", srcAddr.String())
+				continue
+			}
+		}
+
+		log.Printf("[UDP:%s] 收到UDP数据包，大小: %d", srcAddr.String(), n)
+
+		// 处理UDP数据包
+		go assoc.handleUDPPacket(buffer[:n])
+	}
+}
+
+// handleUDPPacket 处理单个UDP数据包
+func (assoc *UDPAssociation) handleUDPPacket(packet []byte) {
+	// 解析SOCKS5 UDP请求头
+	target, data, err := parseSOCKS5UDPPacket(packet)
+	if err != nil {
+		log.Printf("[UDP] 解析UDP数据包失败: %v", err)
+		return
+	}
+
+	log.Printf("[UDP] 目标: %s, 数据长度: %d", target, len(data))
+
+	// 通过WebSocket发送数据
+	if err := assoc.sendUDPData(target, data); err != nil {
+		log.Printf("[UDP] 发送数据失败: %v", err)
+		return
+	}
+
+	// 启动接收goroutine（只启动一次）
+	if !assoc.isReceiving() {
+		go assoc.receiveUDPData()
+	}
+}
+
+var (
+	receivingMu sync.Mutex
+	receiving   = make(map[*UDPAssociation]bool)
+)
+
+func (assoc *UDPAssociation) isReceiving() bool {
+	receivingMu.Lock()
+	defer receivingMu.Unlock()
+	return receiving[assoc]
+}
+
+func (assoc *UDPAssociation) setReceiving() {
+	receivingMu.Lock()
+	defer receivingMu.Unlock()
+	receiving[assoc] = true
+}
+
+func (assoc *UDPAssociation) clearReceiving() {
+	receivingMu.Lock()
+	defer receivingMu.Unlock()
+	delete(receiving, assoc)
+}
+
+// sendUDPData 通过WebSocket发送UDP数据
+func (assoc *UDPAssociation) sendUDPData(target string, data []byte) error {
+	assoc.mu.Lock()
+	defer assoc.mu.Unlock()
+
+	if assoc.closed {
+		return fmt.Errorf("关联已关闭")
+	}
+
+	// 发送UDP_CONNECT消息（包含目标地址）
+	connectMsg := fmt.Sprintf("UDP_CONNECT:%s", target)
+	if err := assoc.wsConn.WriteMessage(websocket.TextMessage, []byte(connectMsg)); err != nil {
+		return fmt.Errorf("发送UDP_CONNECT失败: %v", err)
+	}
+
+	// 发送实际数据
+	dataMsg := append([]byte("UDP_DATA:"), data...)
+	if err := assoc.wsConn.WriteMessage(websocket.BinaryMessage, dataMsg); err != nil {
+		return fmt.Errorf("发送UDP数据失败: %v", err)
+	}
+
+	return nil
+}
+
+// receiveUDPData 接收WebSocket返回的UDP数据
+func (assoc *UDPAssociation) receiveUDPData() {
+	assoc.setReceiving()
+	defer assoc.clearReceiving()
+
+	for {
+		if assoc.IsClosed() {
+			return
+		}
+
+		mt, msg, err := assoc.wsConn.ReadMessage()
+		if err != nil {
+			if !isNormalCloseError(err) {
+				log.Printf("[UDP] WebSocket读取失败: %v", err)
+			}
+			assoc.done <- true
+			return
+		}
+
+		if mt == websocket.TextMessage {
+			data := string(msg)
+			if data == "CLOSE" {
+				log.Printf("[UDP] 收到服务端关闭通知")
+				assoc.done <- true
+				return
+			}
+		} else if mt == websocket.BinaryMessage {
+			// 解析返回的数据: UDP_DATA:host:port:data
+			if len(msg) > 9 && string(msg[:9]) == "UDP_DATA:" {
+				parts := bytes.SplitN(msg[9:], []byte(":"), 3)
+				if len(parts) == 3 {
+					host := string(parts[0])
+					portStr := string(parts[1])
+					data := parts[2]
+
+					port := 0
+					fmt.Sscanf(portStr, "%d", &port)
+
+					// 构建SOCKS5 UDP响应包
+					packet, err := buildSOCKS5UDPPacket(host, port, data)
+					if err != nil {
+						log.Printf("[UDP] 构建响应包失败: %v", err)
+						continue
+					}
+
+					// 发送回客户端
+					if assoc.clientUDPAddr != nil {
+						assoc.mu.Lock()
+						_, err = assoc.udpListener.WriteToUDP(packet, assoc.clientUDPAddr)
+						assoc.mu.Unlock()
+
+						if err != nil {
+							log.Printf("[UDP] 发送UDP响应失败: %v", err)
+							assoc.done <- true
+							return
+						}
+
+						log.Printf("[UDP] 已发送UDP响应: %s:%d, 大小: %d", host, port, len(data))
+					}
+				}
+			}
+		}
+	}
+}
+
+func (assoc *UDPAssociation) IsClosed() bool {
+	assoc.mu.Lock()
+	defer assoc.mu.Unlock()
+	return assoc.closed
+}
+
+func (assoc *UDPAssociation) Close() {
+	assoc.mu.Lock()
+	defer assoc.mu.Unlock()
+
+	if assoc.closed {
+		return
+	}
+
+	assoc.closed = true
+
+	if assoc.wsConn != nil {
+		assoc.wsConn.WriteMessage(websocket.TextMessage, []byte("CLOSE"))
+		assoc.wsConn.Close()
+	}
+
+	if assoc.udpListener != nil {
+		assoc.udpListener.Close()
+	}
+
+	log.Printf("[UDP] 关联资源已清理")
+}
+
+// parseSOCKS5UDPPacket 解析SOCKS5 UDP数据包
+func parseSOCKS5UDPPacket(packet []byte) (string, []byte, error) {
+	if len(packet) < 10 {
+		return "", nil, fmt.Errorf("数据包太短")
+	}
+
+	// RSV (2字节) + FRAG (1字节)
+	if packet[0] != 0 || packet[1] != 0 {
+		return "", nil, fmt.Errorf("无效的RSV字段")
+	}
+
+	frag := packet[2]
+	if frag != 0 {
+		return "", nil, fmt.Errorf("不支持分片 (FRAG=%d)", frag)
+	}
+
+	atyp := packet[3]
+	offset := 4
+
+	var host string
+	switch atyp {
+	case IPv4Addr:
+		if len(packet) < offset+4 {
+			return "", nil, fmt.Errorf("IPv4地址不完整")
+		}
+		host = net.IP(packet[offset : offset+4]).String()
+		offset += 4
+
+	case DomainAddr:
+		if len(packet) < offset+1 {
+			return "", nil, fmt.Errorf("域名长度字段缺失")
+		}
+		domainLen := int(packet[offset])
+		offset++
+		if len(packet) < offset+domainLen {
+			return "", nil, fmt.Errorf("域名数据不完整")
+		}
+		host = string(packet[offset : offset+domainLen])
+		offset += domainLen
+
+	case IPv6Addr:
+		if len(packet) < offset+16 {
+			return "", nil, fmt.Errorf("IPv6地址不完整")
+		}
+		host = net.IP(packet[offset : offset+16]).String()
+		offset += 16
+
+	default:
+		return "", nil, fmt.Errorf("不支持的地址类型: %d", atyp)
+	}
+
+	// 端口
+	if len(packet) < offset+2 {
+		return "", nil, fmt.Errorf("端口字段缺失")
+	}
+	port := int(packet[offset])<<8 | int(packet[offset+1])
+	offset += 2
+
+	// 实际数据
+	data := packet[offset:]
+
+	var target string
+	if atyp == IPv6Addr {
+		target = fmt.Sprintf("[%s]:%d", host, port)
+	} else {
+		target = fmt.Sprintf("%s:%d", host, port)
+	}
+
+	return target, data, nil
+}
+
+// buildSOCKS5UDPPacket 构建SOCKS5 UDP响应数据包
+func buildSOCKS5UDPPacket(host string, port int, data []byte) ([]byte, error) {
+	packet := make([]byte, 0, 1024)
+
+	// RSV (2字节) + FRAG (1字节)
+	packet = append(packet, 0x00, 0x00, 0x00)
+
+	// 解析地址类型
+	ip := net.ParseIP(host)
+	if ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			// IPv4
+			packet = append(packet, IPv4Addr)
+			packet = append(packet, ip4...)
+		} else {
+			// IPv6
+			packet = append(packet, IPv6Addr)
+			packet = append(packet, ip...)
+		}
+	} else {
+		// 域名
+		if len(host) > 255 {
+			return nil, fmt.Errorf("域名过长")
+		}
+		packet = append(packet, DomainAddr)
+		packet = append(packet, byte(len(host)))
+		packet = append(packet, []byte(host)...)
+	}
+
+	// 端口
+	portBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(portBytes, uint16(port))
+	packet = append(packet, portBytes...)
+
+	// 数据
+	packet = append(packet, data...)
+
+	return packet, nil
 }
