@@ -171,6 +171,21 @@ MakeRelease() {
   for i in $(find . -type f -name "$appName-freebsd-*"); do
     tar -czvf compress/"$i".tar.gz "$i"
   done
+  for i in $(find . -type f -name "$appName-dragonfly-*"); do
+    tar -czvf compress/"$i".tar.gz "$i"
+  done
+  for i in $(find . -type f -name "$appName-netbsd-*"); do
+    tar -czvf compress/"$i".tar.gz "$i"
+  done
+  for i in $(find . -type f -name "$appName-openbsd-*"); do
+    tar -czvf compress/"$i".tar.gz "$i"
+  done
+  for i in $(find . -type f -name "$appName-plan9-*"); do
+    tar -czvf compress/"$i".tar.gz "$i"
+  done
+  for i in $(find . -type f -name "$appName-solaris-*"); do
+    tar -czvf compress/"$i".tar.gz "$i"
+  done
   for i in $(find . -type f \( -name "$appName-windows-*" -o -name "$appName-windows7-*" \)); do
     zip compress/$(echo $i | sed 's/\.[^.]*$//').zip "$i"
   done
