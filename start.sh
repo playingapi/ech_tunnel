@@ -27,6 +27,8 @@ mv ech-tunnel-linux-amd64 ech-tunnel
 
 chmod +x ech-tunnel
 
+ls
+
 # ======== 请在这里修改你的配置 ========
 #CLOUDFLARE_URL="ech-img.playingapi.tech" # 你的 cloudflared 域名
 CLOUDFLARE_TOKEN="eyJhIjoiODllMDYzZWYxOGQ3ZmVjZjhlY2E2NTBiYWFjNzZjYmYiLCJ0IjoiZDg4ZjU5OTctZGE3Mi00MzNmLWE5NGUtNGY5MjcyOWU3NTYwIiwicyI6Ik1UZ3dZalU0T1RVdE5qVTJOQzAwTmpJeExXSTJaak10TVRnNU5UazRaVEZqTVRJMCJ9"
