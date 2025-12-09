@@ -6,7 +6,7 @@ COPY start.sh ./
 
 EXPOSE 3000
 
-RUN apk update && apk add --no-cache bash openssl curl tar &&\
+RUN apk update && apk add --no-cache bash openssl curl tar gcompat &&\
     chmod +x start.sh
 
 CMD ["./start.sh"]
